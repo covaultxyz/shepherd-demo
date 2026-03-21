@@ -2,7 +2,8 @@
 SHEPHERD -- Text Message Coach by Denver Griffin
 Standalone Gradio web app for Render deployment.
 
-LLM backend: OpenAI API (GPT-4o) via httpx. No SDK dependencies.
+LLM backend: Multi-provider (Gemini, OpenAI, mock) via httpx. No SDK dependencies.
+Default: Gemini Flash (free tier). Switch via LLM_PROVIDER env var.
 """
 from __future__ import annotations
 
@@ -20,12 +21,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shepherd")
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — multi-provider LLM backend
 # ---------------------------------------------------------------------------
 
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()  # gemini | openai | mock
+
+# Gemini config
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
+# OpenAI config
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-MODEL = os.environ.get("SHEPHERD_MODEL", "gpt-4o")
-MOCK_MODE = os.environ.get("SHEPHERD_MOCK", "").lower() in ("1", "true", "yes")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+
+# Legacy compat
+MOCK_MODE = LLM_PROVIDER == "mock" or os.environ.get("SHEPHERD_MOCK", "").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -218,14 +228,54 @@ def check_crisis(text: str) -> CrisisResult:
     return CrisisResult()
 
 # ---------------------------------------------------------------------------
-# LLM Backend — OpenAI API via httpx
+# LLM Backend — Multi-provider via httpx (Gemini, OpenAI, mock)
 # ---------------------------------------------------------------------------
 
-async def call_llm(messages: list[dict]) -> str:
-    """Call OpenAI API and return the assistant response text."""
-    if MOCK_MODE or not OPENAI_API_KEY:
-        return ""
+def _active_provider_label() -> str:
+    """Return a human-readable label for the active LLM provider."""
+    if MOCK_MODE:
+        return "Mock (no LLM)"
+    if LLM_PROVIDER == "gemini":
+        if not GEMINI_API_KEY:
+            return "Mock (no Gemini key)"
+        return f"Gemini ({GEMINI_MODEL})"
+    if LLM_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            return "Mock (no OpenAI key)"
+        return f"OpenAI ({OPENAI_MODEL})"
+    return f"Unknown ({LLM_PROVIDER})"
 
+
+def _is_llm_available() -> bool:
+    """Check if the configured LLM provider has valid credentials."""
+    if MOCK_MODE:
+        return False
+    if LLM_PROVIDER == "gemini":
+        return bool(GEMINI_API_KEY)
+    if LLM_PROVIDER == "openai":
+        return bool(OPENAI_API_KEY)
+    return False
+
+
+async def _call_gemini(prompt_text: str) -> str:
+    """Call Google Gemini API via REST. Expects a single text prompt."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 2000,
+        },
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def _call_openai(messages: list[dict]) -> str:
+    """Call OpenAI chat completions API."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             "https://api.openai.com/v1/chat/completions",
@@ -234,7 +284,7 @@ async def call_llm(messages: list[dict]) -> str:
                 "Content-Type": "application/json",
             },
             json={
-                "model": MODEL,
+                "model": OPENAI_MODEL,
                 "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 2000,
@@ -243,6 +293,40 @@ async def call_llm(messages: list[dict]) -> str:
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
+
+
+async def call_llm(messages: list[dict]) -> str:
+    """Route to the configured LLM provider and return assistant response text.
+
+    For Gemini: converts the chat messages list into a single text prompt
+    (system + few-shot examples + user message concatenated).
+
+    For OpenAI: passes messages directly as chat format.
+    """
+    if not _is_llm_available():
+        return ""
+
+    if LLM_PROVIDER == "gemini":
+        # Flatten messages into a single text prompt for Gemini's contents format
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                parts.append(content)
+            elif role == "assistant":
+                parts.append(f"[ASSISTANT]:\n{content}")
+            else:
+                parts.append(f"[USER]:\n{content}")
+        prompt_text = "\n\n".join(parts)
+        return await _call_gemini(prompt_text)
+
+    if LLM_PROVIDER == "openai":
+        return await _call_openai(messages)
+
+    # Unknown provider — return empty (falls back to mock behavior)
+    logger.warning("Unknown LLM_PROVIDER=%s, returning empty", LLM_PROVIDER)
+    return ""
 
 
 def parse_json_response(text: str) -> dict:
@@ -274,7 +358,7 @@ def _build_few_shot_block() -> str:
     return "\n".join(lines)
 
 async def analyze_dynamic(wife_message: str) -> DynamicAnalysis:
-    if MOCK_MODE or not OPENAI_API_KEY:
+    if not _is_llm_available():
         return DynamicAnalysis(
             emotional_tone="She is overwhelmed and pulling away. This is a temperature gauge, not a permanent wall.",
             what_she_wants="She needs to feel HEARD without pressure. Zero neediness, zero reactivity.",
@@ -305,7 +389,7 @@ Return ONLY a JSON object:
 
 
 async def critique_response(wife_message: str, student_response: str) -> CritiqueResult:
-    if MOCK_MODE or not OPENAI_API_KEY:
+    if not _is_llm_available():
         return CritiqueResult(
             what_right=["You addressed her message — good, you didn't ignore her."],
             what_wrong=["Too many words. Way more than three lines.", "You made it about YOU instead of HER."],
@@ -338,7 +422,7 @@ Critique this in Denver's voice. Return ONLY JSON:
 
 
 async def suggest_response(wife_message: str) -> SuggestedResponse:
-    if MOCK_MODE or not OPENAI_API_KEY:
+    if not _is_llm_available():
         return SuggestedResponse(
             response="I hear you. Take all the time you need \U0001f91d",
             reasoning=["Acknowledges her without pressure", "Masculine brevity", "No questions, no begging"],
@@ -480,6 +564,7 @@ CSS = """
 .crisis-alert { border: 2px solid #ff4444 !important; background: rgba(255,68,68,0.15) !important; border-radius: 8px !important; padding: 16px !important; }
 .gradio-container textarea, .gradio-container input { font-size: 16px !important; }
 .primary-btn { font-size: 16px !important; font-weight: 600 !important; min-height: 44px !important; }
+.footer-text { text-align: center; font-size: 0.8em; opacity: 0.5; margin-top: 20px; }
 """
 
 THEME = gr.themes.Base(
@@ -521,6 +606,8 @@ def build_app() -> gr.Blocks:
         coaching_output = gr.Markdown(value="", visible=False)
         reset_btn = gr.Button("Start Over", variant="secondary", size="sm")
 
+        gr.Markdown(f"<div class='footer-text'>Model: {_active_provider_label()}</div>")
+
         # Wire events
         submit_btn.click(handle_step1, [wife_text],
                          [analysis_output, wife_state, step2, analysis_output, crisis_box])
@@ -540,8 +627,8 @@ def build_app() -> gr.Blocks:
 app = build_app()
 
 if __name__ == "__main__":
-    mode = "MOCK" if (MOCK_MODE or not OPENAI_API_KEY) else f"LIVE ({MODEL})"
+    label = _active_provider_label()
     print(f"\n  SHEPHERD -- Text Message Coach")
-    print(f"  Mode: {mode}")
+    print(f"  Provider: {label}")
     port = int(os.environ.get("PORT", 7860))
     app.launch(server_name="0.0.0.0", server_port=port, show_error=True)

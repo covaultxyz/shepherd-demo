@@ -258,7 +258,7 @@ def _is_llm_available() -> bool:
 
 
 async def _call_gemini(prompt_text: str) -> str:
-    """Call Google Gemini API via REST. Expects a single text prompt."""
+    """Call Google Gemini API via REST with retry on 429."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
@@ -268,10 +268,21 @@ async def _call_gemini(prompt_text: str) -> str:
         },
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        for attempt in range(3):
+            resp = await client.post(url, json=payload)
+            if resp.status_code == 429:
+                wait = 2 ** attempt + 1  # 2s, 3s, 5s
+                logger.warning("Gemini 429 rate limit, retry %d in %ds", attempt + 1, wait)
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        # All retries exhausted — try OpenAI fallback if available
+        if OPENAI_API_KEY:
+            logger.info("Gemini rate limited, falling back to OpenAI")
+            return ""  # signal caller to try fallback
+        raise httpx.HTTPStatusError("Gemini 429 after 3 retries", request=resp.request, response=resp)
 
 
 async def _call_openai(messages: list[dict]) -> str:
@@ -306,10 +317,9 @@ async def call_llm(messages: list[dict]) -> str:
     if not _is_llm_available():
         return ""
 
-    if LLM_PROVIDER == "gemini":
-        # Flatten messages into a single text prompt for Gemini's contents format
+    def _flatten_for_gemini(msgs):
         parts = []
-        for msg in messages:
+        for msg in msgs:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role == "system":
@@ -318,8 +328,20 @@ async def call_llm(messages: list[dict]) -> str:
                 parts.append(f"[ASSISTANT]:\n{content}")
             else:
                 parts.append(f"[USER]:\n{content}")
-        prompt_text = "\n\n".join(parts)
-        return await _call_gemini(prompt_text)
+        return "\n\n".join(parts)
+
+    if LLM_PROVIDER == "gemini":
+        try:
+            result = await _call_gemini(_flatten_for_gemini(messages))
+            if result:  # non-empty means success
+                return result
+        except Exception as exc:
+            logger.warning("Gemini failed: %s", exc)
+        # Auto-fallback to OpenAI if available
+        if OPENAI_API_KEY:
+            logger.info("Falling back to OpenAI")
+            return await _call_openai(messages)
+        return ""
 
     if LLM_PROVIDER == "openai":
         return await _call_openai(messages)

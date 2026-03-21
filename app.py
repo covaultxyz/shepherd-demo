@@ -333,18 +333,25 @@ async def call_llm(messages: list[dict]) -> str:
     if LLM_PROVIDER == "gemini":
         try:
             result = await _call_gemini(_flatten_for_gemini(messages))
-            if result:  # non-empty means success
+            if result:
                 return result
         except Exception as exc:
             logger.warning("Gemini failed: %s", exc)
         # Auto-fallback to OpenAI if available
         if OPENAI_API_KEY:
             logger.info("Falling back to OpenAI")
-            return await _call_openai(messages)
-        return ""
+            try:
+                return await _call_openai(messages)
+            except Exception as exc2:
+                logger.warning("OpenAI fallback also failed: %s", exc2)
+        return ""  # both failed — will use mock responses
 
     if LLM_PROVIDER == "openai":
-        return await _call_openai(messages)
+        try:
+            return await _call_openai(messages)
+        except Exception as exc:
+            logger.warning("OpenAI failed: %s", exc)
+            return ""  # will use mock responses
 
     # Unknown provider — return empty (falls back to mock behavior)
     logger.warning("Unknown LLM_PROVIDER=%s, returning empty", LLM_PROVIDER)
@@ -551,7 +558,15 @@ async def handle_step1(wife_text: str):
     if crisis.is_crisis:
         return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=True, value=fmt_crisis(crisis))
 
-    analysis = await analyze_dynamic(wife_message)
+    try:
+        analysis = await analyze_dynamic(wife_message)
+    except Exception as exc:
+        logger.error("handle_step1 error: %s", exc)
+        analysis = DynamicAnalysis(
+            emotional_tone="She is communicating something important. Read her words carefully.",
+            what_she_wants="She needs to feel heard, valued, and seen — without pressure.",
+            confirmation_bias_risk="Assume high. Any reactive response feeds her narrative.",
+            recommended_approach="Short, masculine, centered on her. Two lines max. One emoji.")
     return fmt_analysis(analysis), wife_message, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False, value="")
 
 
@@ -561,14 +576,32 @@ async def handle_critique(draft: str, wife_message: str):
     crisis = check_crisis(draft)
     if crisis.is_crisis:
         return fmt_crisis(crisis), gr.update(visible=True)
-    result = await critique_response(wife_message, draft)
+    try:
+        result = await critique_response(wife_message, draft)
+    except Exception as exc:
+        logger.error("handle_critique error: %s", exc)
+        result = CritiqueResult(
+            what_right=["You responded — that shows you care."],
+            what_wrong=["Could not analyze right now — API is temporarily busy."],
+            principles=["Try again in 30 seconds"],
+            revised_response="I hear you \U0001f64f",
+            changes_explained=["Keep it short, centered on her"],
+            denver_voice_note="API hit a speed bump. Try again — you're doing the work and that matters.")
     return fmt_critique(result), gr.update(visible=True)
 
 
 async def handle_suggest(wife_message: str):
     if not wife_message:
         return "*Submit her message in Step 1 first.*", gr.update(visible=True)
-    result = await suggest_response(wife_message)
+    try:
+        result = await suggest_response(wife_message)
+    except Exception as exc:
+        logger.error("handle_suggest error: %s", exc)
+        result = SuggestedResponse(
+            response="I hear you. That makes sense \U0001f64f",
+            reasoning=["Keep it short", "Center HER feelings", "One emoji"],
+            principles=["hvs", "masculine_brevity", "center_her"],
+            denver_voice_note="API is busy — but this default response follows every rule. Use it.")
     return fmt_suggestion(result), gr.update(visible=True)
 
 

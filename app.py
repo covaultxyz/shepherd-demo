@@ -575,9 +575,9 @@ THEME = gr.themes.Base(
 )
 
 def build_app() -> gr.Blocks:
-    with gr.Blocks(title="SHEPHERD -- Text Message Coach", css=CSS, theme=THEME) as app:
-        gr.Markdown("<div class='title-text'>SHEPHERD -- Text Message Coach</div>")
-        gr.Markdown("<div class='subtitle-text'>by Denver Griffin | Divorce Stoppers</div>")
+    with gr.Blocks(title="SHEPHERD -- Text Message Coach") as app:
+        gr.Markdown("# SHEPHERD -- Text Message Coach")
+        gr.Markdown("*by Denver Griffin | Divorce Stoppers*")
 
         wife_state = gr.State("")
         crisis_box = gr.Markdown(value="", visible=False, elem_classes=["crisis-alert"])
@@ -606,7 +606,7 @@ def build_app() -> gr.Blocks:
         coaching_output = gr.Markdown(value="", visible=False)
         reset_btn = gr.Button("Start Over", variant="secondary", size="sm")
 
-        gr.Markdown(f"<div class='footer-text'>Model: {_active_provider_label()}</div>")
+        gr.Markdown(f"---\n*Model: {_active_provider_label()}*")
 
         # Wire events
         submit_btn.click(handle_step1, [wife_text],
@@ -631,4 +631,4 @@ if __name__ == "__main__":
     print(f"\n  SHEPHERD -- Text Message Coach")
     print(f"  Provider: {label}")
     port = int(os.environ.get("PORT", 7860))
-    app.launch(server_name="0.0.0.0", server_port=port, show_error=True)
+    app.launch(server_name="0.0.0.0", server_port=port, show_error=True, css=CSS, theme=THEME)

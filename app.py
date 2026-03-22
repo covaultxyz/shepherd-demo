@@ -154,6 +154,242 @@ class CrisisResult:
     resources: list[str] = field(default_factory=list)
     message: str = ""
 
+@dataclass
+class ResponseScore:
+    total_score: int = 0
+    rule_scores: dict[str, int] = field(default_factory=dict)
+    violations: list[str] = field(default_factory=list)
+    grade: str = ""
+    denver_one_liner: str = ""
+
+# ---------------------------------------------------------------------------
+# Pre-submit scoring -- heuristic, no LLM
+# ---------------------------------------------------------------------------
+
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001f600-\U0001f64f"
+    "\U0001f300-\U0001f5ff"
+    "\U0001f680-\U0001f6ff"
+    "\U0001f900-\U0001f9ff"
+    "\U0001fa00-\U0001fa6f"
+    "\U0001fa70-\U0001faff"
+    "\u2600-\u26ff"
+    "\u2700-\u27bf"
+    "\u2300-\u23ff"
+    "\u200d"
+    "\ufe0f"
+    "]"
+)
+
+_RULE_DISPLAY_NAMES = {
+    "three_line_rule": "Three Lines Max",
+    "emoji_rule": "Always Use Emojis",
+    "no_double_text": "Never Double-Text",
+    "one_topic_rule": "One Topic Only",
+    "hvs_rule": "HVS (Heard, Valued, Seen)",
+    "center_her": "Center HER, Not You",
+    "masculine_brevity": "Masculine Brevity",
+}
+
+_GRADE_ONE_LINERS = {
+    "A": "Now THAT is masculine communication, brother.",
+    "B": "Getting there. A few tweaks and you're golden.",
+    "C": "You're trying, I'll give you that. But we got work to do.",
+    "D": "Skippy boy, we need to talk about what just happened.",
+    "F": "What the fuck was that? Start over.",
+}
+
+
+def _compute_grade(total_score: int) -> str:
+    if total_score >= 9:
+        return "A"
+    elif total_score >= 7:
+        return "B"
+    elif total_score >= 5:
+        return "C"
+    elif total_score >= 3:
+        return "D"
+    else:
+        return "F"
+
+
+def score_response_heuristic(wife_message: str, student_response: str) -> ResponseScore:
+    """Score a student's draft against Denver's 7 rules. No LLM needed."""
+    scores: dict[str, int] = {}
+
+    line_count = student_response.count("\n") + 1
+    word_count = len(student_response.split())
+    scores["three_line_rule"] = 1 if line_count <= 3 and word_count <= 50 else 0
+
+    has_emoji = bool(_EMOJI_PATTERN.search(student_response))
+    scores["emoji_rule"] = 1 if has_emoji else 0
+
+    scores["no_double_text"] = 1  # can't check from single message
+
+    student_sentences = [s for s in re.split(r"[.!?]+", student_response) if s.strip()]
+    scores["one_topic_rule"] = 1 if len(student_sentences) <= 2 else 0
+
+    her_words = len(re.findall(r"\b(you|your|yours|her|she)\b", student_response, re.I))
+    i_words = len(re.findall(r"\b(I|me|my|mine|myself)\b", student_response, re.I))
+    scores["hvs_rule"] = 1 if her_words >= i_words else 0
+
+    scores["center_her"] = 1 if i_words <= 1 else 0
+
+    scores["masculine_brevity"] = 1 if word_count <= 30 else 0
+
+    violations = [
+        _RULE_DISPLAY_NAMES.get(rule, rule)
+        for rule, passed in scores.items()
+        if passed == 0
+    ]
+
+    passed_count = sum(scores.values())
+    total_raw = round(passed_count * 10 / 7)
+    total_score = max(1, min(10, total_raw))
+
+    grade = _compute_grade(total_score)
+    one_liner = _GRADE_ONE_LINERS.get(grade, "")
+
+    return ResponseScore(
+        total_score=total_score,
+        rule_scores=scores,
+        violations=violations,
+        grade=grade,
+        denver_one_liner=one_liner,
+    )
+
+
+def fmt_score(s: ResponseScore) -> str:
+    """Format a ResponseScore into markdown for Gradio."""
+    parts: list[str] = []
+    parts.append(f"## Quick Score: {s.total_score}/10 (Grade {s.grade})")
+    parts.append(f'*"{s.denver_one_liner}"*')
+    parts.append("")
+    for rule_key, passed in s.rule_scores.items():
+        name = _RULE_DISPLAY_NAMES.get(rule_key, rule_key)
+        marker = "PASS" if passed else "FAIL"
+        parts.append(f"- **{marker}** -- {name}")
+    return "\n".join(parts)
+
+# ---------------------------------------------------------------------------
+# Conversation History -- multi-turn session memory
+# ---------------------------------------------------------------------------
+
+CONVERSATION_HISTORY_TEMPLATE = """
+## RECENT CONVERSATION HISTORY
+{history_block}
+
+Use this history to:
+- Reference patterns you noticed earlier ("Remember when she said X and you did Y?")
+- Track progress within the session ("Good -- you're improving from your last draft")
+- Connect themes across wife's messages ("She's been consistent about needing space")
+- Avoid repeating the same coaching points
+"""
+
+@dataclass
+class ConversationTurn:
+    """One complete coaching exchange."""
+    wife_message: str = ""
+    analysis: DynamicAnalysis | None = None
+    student_draft: str | None = None
+    critique: CritiqueResult | None = None
+    suggestion: SuggestedResponse | None = None
+    timestamp: str = ""
+
+
+class ConversationHistory:
+    """Tracks conversation turns within a session (max N)."""
+
+    def __init__(self, max_turns: int = 5):
+        self._turns: list[ConversationTurn] = []
+        self._max_turns = max_turns
+        self._current_turn: ConversationTurn | None = None
+
+    def start_turn(self, wife_message: str) -> None:
+        self._current_turn = ConversationTurn(
+            wife_message=wife_message,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def add_analysis(self, analysis: DynamicAnalysis) -> None:
+        if self._current_turn is not None:
+            self._current_turn.analysis = analysis
+
+    def add_critique(self, draft: str, critique: CritiqueResult) -> None:
+        if self._current_turn is not None:
+            self._current_turn.student_draft = draft
+            self._current_turn.critique = critique
+
+    def add_suggestion(self, suggestion: SuggestedResponse) -> None:
+        if self._current_turn is not None:
+            self._current_turn.suggestion = suggestion
+
+    def complete_turn(self) -> None:
+        if self._current_turn is not None:
+            self._turns.append(self._current_turn)
+            if len(self._turns) > self._max_turns:
+                self._turns = self._turns[-self._max_turns:]
+            self._current_turn = None
+
+    def get_context_block(self) -> str:
+        all_turns = list(self._turns)
+        if self._current_turn is not None:
+            all_turns.append(self._current_turn)
+        if not all_turns:
+            return ""
+        parts: list[str] = []
+        now = datetime.now(timezone.utc)
+        for i, turn in enumerate(all_turns, 1):
+            time_label = self._relative_time(turn.timestamp, now)
+            parts.append(f"Turn {i} ({time_label}):")
+            parts.append(f'  Wife said: "{turn.wife_message}"')
+            if turn.analysis:
+                tone = turn.analysis.emotional_tone
+                summary = tone[:120] if tone else ""
+                if turn.analysis.confirmation_bias_risk:
+                    summary += f" | Confirmation bias risk: {turn.analysis.confirmation_bias_risk[:80]}"
+                parts.append(f"  Analysis: {summary}")
+            if turn.student_draft:
+                parts.append(f'  Student drafted: "{turn.student_draft}"')
+            if turn.critique and turn.critique.revised_response:
+                parts.append(f'  Denver coached: "{turn.critique.revised_response}"')
+                if turn.critique.what_wrong:
+                    parts.append(f"  Key issues: {'; '.join(turn.critique.what_wrong[:2])}")
+            if turn.suggestion and turn.suggestion.response:
+                parts.append(f'  Denver suggested: "{turn.suggestion.response}"')
+            parts.append("")
+        history_block = "\n".join(parts).rstrip()
+        return CONVERSATION_HISTORY_TEMPLATE.format(history_block=history_block)
+
+    @property
+    def turn_count(self) -> int:
+        return len(self._turns)
+
+    def clear(self) -> None:
+        self._turns.clear()
+        self._current_turn = None
+
+    @staticmethod
+    def _relative_time(timestamp: str, now: datetime) -> str:
+        if not timestamp:
+            return "unknown"
+        try:
+            ts = datetime.fromisoformat(timestamp)
+            delta = now - ts
+            seconds = int(delta.total_seconds())
+            if seconds < 60:
+                return "just now"
+            elif seconds < 3600:
+                return f"{seconds // 60} min ago"
+            elif seconds < 86400:
+                return f"{seconds // 3600} hr ago"
+            else:
+                return ts.strftime("%b %d %I:%M %p")
+        except (ValueError, TypeError):
+            return "unknown"
+
+
 # ---------------------------------------------------------------------------
 # System Prompt — Denver's voice
 # ---------------------------------------------------------------------------
@@ -347,7 +583,7 @@ async def _call_gemini(prompt_text: str) -> str:
         "contents": [{"parts": [{"text": prompt_text}]}],
         "generationConfig": {
             "temperature": 0.7,
-            "maxOutputTokens": 2000,
+            "maxOutputTokens": 8192,
         },
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -469,7 +705,7 @@ def _build_few_shot_block() -> str:
         lines.append(f"[{role}]:\n{ex['content']}\n")
     return "\n".join(lines)
 
-async def analyze_dynamic(wife_message: str) -> DynamicAnalysis:
+async def analyze_dynamic(wife_message: str, conversation_history: str = "") -> DynamicAnalysis:
     if not _is_llm_available():
         return DynamicAnalysis(
             emotional_tone="She is overwhelmed and pulling away. This is a temperature gauge, not a permanent wall.",
@@ -478,6 +714,8 @@ async def analyze_dynamic(wife_message: str) -> DynamicAnalysis:
             recommended_approach="One topic. Two lines max. Acknowledge HER. Emoji. Be the Valium.")
 
     prompt = f"""{SYSTEM_PROMPT}
+
+{conversation_history}
 
 WIFE'S MESSAGE:
 "{wife_message}"
@@ -500,7 +738,7 @@ Return ONLY a JSON object:
     return DynamicAnalysis(**{k: data.get(k, "") for k in ["emotional_tone", "what_she_wants", "confirmation_bias_risk", "recommended_approach"]})
 
 
-async def critique_response(wife_message: str, student_response: str) -> CritiqueResult:
+async def critique_response(wife_message: str, student_response: str, conversation_history: str = "") -> CritiqueResult:
     if not _is_llm_available():
         return CritiqueResult(
             what_right=["You addressed her message — good, you didn't ignore her."],
@@ -514,6 +752,8 @@ async def critique_response(wife_message: str, student_response: str) -> Critiqu
 
 ## EXAMPLES
 {_build_few_shot_block()}
+
+{conversation_history}
 
 ## CURRENT EXCHANGE
 
@@ -533,7 +773,7 @@ Critique this in Denver's voice. Return ONLY JSON:
         ("revised_response", ""), ("changes_explained", []), ("denver_voice_note", "")]})
 
 
-async def suggest_response(wife_message: str) -> SuggestedResponse:
+async def suggest_response(wife_message: str, conversation_history: str = "") -> SuggestedResponse:
     if not _is_llm_available():
         return SuggestedResponse(
             response="I hear you. Take all the time you need \U0001f91d",
@@ -545,6 +785,8 @@ async def suggest_response(wife_message: str) -> SuggestedResponse:
 
 ## EXAMPLES
 {_build_few_shot_block()}
+
+{conversation_history}
 
 WIFE'S MESSAGE: "{wife_message}"
 
@@ -632,10 +874,12 @@ def fmt_suggestion(s: SuggestedResponse) -> str:
 # Gradio Handlers
 # ---------------------------------------------------------------------------
 
-async def handle_step1(wife_text: str, session_id: str):
+async def handle_step1(wife_text: str, session_id: str, history: ConversationHistory | None):
     wife_message = wife_text.strip()
+    if history is None:
+        history = ConversationHistory()
     if not wife_message:
-        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""), session_id
+        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""), session_id, history
 
     # Assign a session ID on first interaction
     if not session_id:
@@ -644,10 +888,14 @@ async def handle_step1(wife_text: str, session_id: str):
     crisis = check_crisis(wife_message)
     if crisis.is_crisis:
         _log_chat_event(session_id, "crisis", wife_message, f"{crisis.crisis_type}: {crisis.message}")
-        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=True, value=fmt_crisis(crisis)), session_id
+        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=True, value=fmt_crisis(crisis)), session_id, history
+
+    # Start a new conversation turn
+    history.start_turn(wife_message)
+    history_block = history.get_context_block()
 
     try:
-        analysis = await analyze_dynamic(wife_message)
+        analysis = await analyze_dynamic(wife_message, conversation_history=history_block)
     except Exception as exc:
         logger.error("handle_step1 error: %s", exc)
         analysis = DynamicAnalysis(
@@ -655,20 +903,33 @@ async def handle_step1(wife_text: str, session_id: str):
             what_she_wants="She needs to feel heard, valued, and seen — without pressure.",
             confirmation_bias_risk="Assume high. Any reactive response feeds her narrative.",
             recommended_approach="Short, masculine, centered on her. Two lines max. One emoji.")
+
+    # Record analysis in history
+    history.add_analysis(analysis)
+
     _log_chat_event(session_id, "analysis", wife_message, f"{analysis.emotional_tone} | Approach: {analysis.recommended_approach}")
-    return fmt_analysis(analysis), wife_message, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False, value=""), session_id
+    return fmt_analysis(analysis), wife_message, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False, value=""), session_id, history
 
 
-async def handle_critique(draft: str, wife_message: str, session_id: str):
+async def handle_critique(draft: str, wife_message: str, session_id: str, history: ConversationHistory | None):
+    if history is None:
+        history = ConversationHistory()
     if not draft.strip():
-        return "*Type your draft response first.*", gr.update(visible=True)
+        return "*Type your draft response first.*", gr.update(visible=True), history
     crisis = check_crisis(draft)
     if crisis.is_crisis:
         if session_id:
             _log_chat_event(session_id, "crisis", wife_message, f"Crisis in draft: {crisis.crisis_type}", user_draft=draft)
-        return fmt_crisis(crisis), gr.update(visible=True)
+        return fmt_crisis(crisis), gr.update(visible=True), history
+
+    # Instant heuristic score (no LLM)
+    quick_score = score_response_heuristic(wife_message, draft)
+    score_block = fmt_score(quick_score)
+
+    history_block = history.get_context_block()
+
     try:
-        result = await critique_response(wife_message, draft)
+        result = await critique_response(wife_message, draft, conversation_history=history_block)
     except Exception as exc:
         logger.error("handle_critique error: %s", exc)
         result = CritiqueResult(
@@ -678,18 +939,29 @@ async def handle_critique(draft: str, wife_message: str, session_id: str):
             revised_response="I hear you \U0001f64f",
             changes_explained=["Keep it short, centered on her"],
             denver_voice_note="API hit a speed bump. Try again — you're doing the work and that matters.")
+
+    # Record critique in history and complete the turn
+    history.add_critique(draft, result)
+    history.complete_turn()
+
     if session_id:
         _log_chat_event(session_id, "critique", wife_message,
-                        f"Revised: \"{result.revised_response}\" | {result.denver_voice_note}",
+                        f"Score: {quick_score.total_score}/10 ({quick_score.grade}) | Revised: \"{result.revised_response}\" | {result.denver_voice_note}",
                         user_draft=draft)
-    return fmt_critique(result), gr.update(visible=True)
+    # Show score block above the full critique
+    return score_block + "\n\n---\n\n" + fmt_critique(result), gr.update(visible=True), history
 
 
-async def handle_suggest(wife_message: str, session_id: str):
+async def handle_suggest(wife_message: str, session_id: str, history: ConversationHistory | None):
+    if history is None:
+        history = ConversationHistory()
     if not wife_message:
-        return "*Submit her message in Step 1 first.*", gr.update(visible=True)
+        return "*Submit her message in Step 1 first.*", gr.update(visible=True), history
+
+    history_block = history.get_context_block()
+
     try:
-        result = await suggest_response(wife_message)
+        result = await suggest_response(wife_message, conversation_history=history_block)
     except Exception as exc:
         logger.error("handle_suggest error: %s", exc)
         result = SuggestedResponse(
@@ -697,14 +969,19 @@ async def handle_suggest(wife_message: str, session_id: str):
             reasoning=["Keep it short", "Center HER feelings", "One emoji"],
             principles=["hvs", "masculine_brevity", "center_her"],
             denver_voice_note="API is busy — but this default response follows every rule. Use it.")
+
+    # Record suggestion in history and complete the turn
+    history.add_suggestion(result)
+    history.complete_turn()
+
     if session_id:
         _log_chat_event(session_id, "suggestion", wife_message,
                         f"\"{result.response}\" | {result.denver_voice_note}")
-    return fmt_suggestion(result), gr.update(visible=True)
+    return fmt_suggestion(result), gr.update(visible=True), history
 
 
 def handle_reset():
-    return "", "", gr.update(visible=False), gr.update(visible=False, value=""), gr.update(visible=False, value=""), "", gr.update(visible=False, value=""), ""
+    return "", "", gr.update(visible=False), gr.update(visible=False, value=""), gr.update(visible=False, value=""), "", gr.update(visible=False, value=""), "", ConversationHistory()
 
 # ---------------------------------------------------------------------------
 # Admin Handlers
@@ -756,6 +1033,7 @@ def build_app() -> gr.Blocks:
             with gr.TabItem("Coaching"):
                 wife_state = gr.State("")
                 session_state = gr.State("")
+                history_state = gr.State(ConversationHistory())
                 crisis_box = gr.Markdown(value="", visible=False, elem_classes=["crisis-alert"])
 
                 # Step 1
@@ -785,14 +1063,14 @@ def build_app() -> gr.Blocks:
                 gr.Markdown(f"---\n*Model: {_active_provider_label()}*")
 
                 # Wire coaching events
-                submit_btn.click(handle_step1, [wife_text, session_state],
-                                 [analysis_output, wife_state, step2, analysis_output, crisis_box, session_state])
-                critique_btn.click(handle_critique, [draft_text, wife_state, session_state],
-                                   [coaching_output, coaching_output])
-                suggest_btn.click(handle_suggest, [wife_state, session_state],
-                                  [coaching_output, coaching_output])
+                submit_btn.click(handle_step1, [wife_text, session_state, history_state],
+                                 [analysis_output, wife_state, step2, analysis_output, crisis_box, session_state, history_state])
+                critique_btn.click(handle_critique, [draft_text, wife_state, session_state, history_state],
+                                   [coaching_output, coaching_output, history_state])
+                suggest_btn.click(handle_suggest, [wife_state, session_state, history_state],
+                                  [coaching_output, coaching_output, history_state])
                 reset_btn.click(handle_reset, [],
-                                [wife_text, analysis_output, wife_state, step2, crisis_box, draft_text, coaching_output, session_state])
+                                [wife_text, analysis_output, wife_state, step2, crisis_box, draft_text, coaching_output, session_state, history_state])
 
             # ---- Admin chat log tab ----
             with gr.TabItem("Admin: Chat Logs"):

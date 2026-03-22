@@ -12,7 +12,9 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import gradio as gr
 import httpx
@@ -36,6 +38,87 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 
 # Legacy compat
 MOCK_MODE = LLM_PROVIDER == "mock" or os.environ.get("SHEPHERD_MOCK", "").lower() in ("1", "true", "yes")
+
+# Admin PIN for chat log viewer
+ADMIN_PIN = os.environ.get("SHEPHERD_ADMIN_PIN", "0000")
+
+# ---------------------------------------------------------------------------
+# In-memory chat log (MVP — lost on redeploy, sufficient for demo)
+# ---------------------------------------------------------------------------
+
+_chat_history: list[dict] = []
+# Each entry: {
+#   "session_id": str,
+#   "timestamp": str (ISO-8601),
+#   "event": str ("analysis" | "critique" | "suggestion" | "crisis"),
+#   "wife_message": str,
+#   "user_draft": str | None,
+#   "result_summary": str,
+# }
+
+
+def _log_chat_event(
+    session_id: str,
+    event: str,
+    wife_message: str,
+    result_summary: str,
+    user_draft: str | None = None,
+) -> None:
+    """Append a coaching interaction to the in-memory chat log."""
+    _chat_history.append({
+        "session_id": session_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "wife_message": wife_message,
+        "user_draft": user_draft,
+        "result_summary": result_summary,
+    })
+
+
+def _format_chat_log() -> str:
+    """Render the in-memory chat log as readable markdown."""
+    if not _chat_history:
+        return "*No coaching interactions recorded yet.*"
+
+    # Group entries by session_id, preserving order of first appearance
+    from collections import OrderedDict
+    sessions: OrderedDict[str, list[dict]] = OrderedDict()
+    for entry in _chat_history:
+        sid = entry["session_id"]
+        if sid not in sessions:
+            sessions[sid] = []
+        sessions[sid].append(entry)
+
+    parts: list[str] = []
+    for sid, entries in sessions.items():
+        first_ts = entries[0]["timestamp"]
+        try:
+            dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            ts_label = dt.strftime("%b %d, %Y %I:%M %p UTC")
+        except (ValueError, TypeError):
+            ts_label = first_ts
+        parts.append(f"### Session {sid[:8]} ({ts_label})")
+        parts.append("")
+        for entry in entries:
+            event = entry["event"]
+            if event == "analysis":
+                parts.append(f"**Wife's message:** \"{entry['wife_message']}\"")
+                parts.append("")
+                parts.append(f"> Analysis: {entry['result_summary']}")
+            elif event == "critique":
+                parts.append(f"**Student draft:** \"{entry.get('user_draft', '')}\"")
+                parts.append("")
+                parts.append(f"> Critique: {entry['result_summary']}")
+            elif event == "suggestion":
+                parts.append(f"> Suggested response: {entry['result_summary']}")
+            elif event == "crisis":
+                parts.append(f"**[CRISIS DETECTED]** {entry['result_summary']}")
+            parts.append("")
+        parts.append("---")
+        parts.append("")
+
+    return "\n".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -549,14 +632,19 @@ def fmt_suggestion(s: SuggestedResponse) -> str:
 # Gradio Handlers
 # ---------------------------------------------------------------------------
 
-async def handle_step1(wife_text: str):
+async def handle_step1(wife_text: str, session_id: str):
     wife_message = wife_text.strip()
     if not wife_message:
-        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value="")
+        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""), session_id
+
+    # Assign a session ID on first interaction
+    if not session_id:
+        session_id = uuid.uuid4().hex
 
     crisis = check_crisis(wife_message)
     if crisis.is_crisis:
-        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=True, value=fmt_crisis(crisis))
+        _log_chat_event(session_id, "crisis", wife_message, f"{crisis.crisis_type}: {crisis.message}")
+        return "", "", gr.update(visible=False), gr.update(visible=False), gr.update(visible=True, value=fmt_crisis(crisis)), session_id
 
     try:
         analysis = await analyze_dynamic(wife_message)
@@ -567,14 +655,17 @@ async def handle_step1(wife_text: str):
             what_she_wants="She needs to feel heard, valued, and seen — without pressure.",
             confirmation_bias_risk="Assume high. Any reactive response feeds her narrative.",
             recommended_approach="Short, masculine, centered on her. Two lines max. One emoji.")
-    return fmt_analysis(analysis), wife_message, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False, value="")
+    _log_chat_event(session_id, "analysis", wife_message, f"{analysis.emotional_tone} | Approach: {analysis.recommended_approach}")
+    return fmt_analysis(analysis), wife_message, gr.update(visible=True), gr.update(visible=True), gr.update(visible=False, value=""), session_id
 
 
-async def handle_critique(draft: str, wife_message: str):
+async def handle_critique(draft: str, wife_message: str, session_id: str):
     if not draft.strip():
         return "*Type your draft response first.*", gr.update(visible=True)
     crisis = check_crisis(draft)
     if crisis.is_crisis:
+        if session_id:
+            _log_chat_event(session_id, "crisis", wife_message, f"Crisis in draft: {crisis.crisis_type}", user_draft=draft)
         return fmt_crisis(crisis), gr.update(visible=True)
     try:
         result = await critique_response(wife_message, draft)
@@ -587,10 +678,14 @@ async def handle_critique(draft: str, wife_message: str):
             revised_response="I hear you \U0001f64f",
             changes_explained=["Keep it short, centered on her"],
             denver_voice_note="API hit a speed bump. Try again — you're doing the work and that matters.")
+    if session_id:
+        _log_chat_event(session_id, "critique", wife_message,
+                        f"Revised: \"{result.revised_response}\" | {result.denver_voice_note}",
+                        user_draft=draft)
     return fmt_critique(result), gr.update(visible=True)
 
 
-async def handle_suggest(wife_message: str):
+async def handle_suggest(wife_message: str, session_id: str):
     if not wife_message:
         return "*Submit her message in Step 1 first.*", gr.update(visible=True)
     try:
@@ -602,11 +697,33 @@ async def handle_suggest(wife_message: str):
             reasoning=["Keep it short", "Center HER feelings", "One emoji"],
             principles=["hvs", "masculine_brevity", "center_her"],
             denver_voice_note="API is busy — but this default response follows every rule. Use it.")
+    if session_id:
+        _log_chat_event(session_id, "suggestion", wife_message,
+                        f"\"{result.response}\" | {result.denver_voice_note}")
     return fmt_suggestion(result), gr.update(visible=True)
 
 
 def handle_reset():
-    return "", "", gr.update(visible=False), gr.update(visible=False, value=""), gr.update(visible=False, value=""), "", gr.update(visible=False, value="")
+    return "", "", gr.update(visible=False), gr.update(visible=False, value=""), gr.update(visible=False, value=""), "", gr.update(visible=False, value=""), ""
+
+# ---------------------------------------------------------------------------
+# Admin Handlers
+# ---------------------------------------------------------------------------
+
+def handle_view_logs(pin: str) -> str:
+    """Return chat log markdown if PIN is correct, otherwise access denied."""
+    if pin != ADMIN_PIN:
+        return "**Access denied.** Incorrect PIN."
+    return _format_chat_log()
+
+
+def handle_clear_logs(pin: str) -> str:
+    """Clear all in-memory chat logs if PIN is correct."""
+    if pin != ADMIN_PIN:
+        return "**Access denied.** Incorrect PIN."
+    _chat_history.clear()
+    return "*Chat logs cleared.*"
+
 
 # ---------------------------------------------------------------------------
 # Build UI
@@ -634,44 +751,66 @@ def build_app() -> gr.Blocks:
         gr.Markdown("# SHEPHERD -- Text Message Coach")
         gr.Markdown("*by Denver Griffin | Divorce Stoppers*")
 
-        wife_state = gr.State("")
-        crisis_box = gr.Markdown(value="", visible=False, elem_classes=["crisis-alert"])
+        with gr.Tabs():
+            # ---- Main coaching tab (unchanged layout) ----
+            with gr.TabItem("Coaching"):
+                wife_state = gr.State("")
+                session_state = gr.State("")
+                crisis_box = gr.Markdown(value="", visible=False, elem_classes=["crisis-alert"])
 
-        # Step 1
-        gr.Markdown("### Step 1: What did she text you?")
-        wife_text = gr.Textbox(
-            label="Her message",
-            placeholder="Don't just tell me what she said -- show me exactly what she texted...",
-            lines=4, max_lines=8)
-        submit_btn = gr.Button("Submit", variant="primary", elem_classes=["primary-btn"])
+                # Step 1
+                gr.Markdown("### Step 1: What did she text you?")
+                wife_text = gr.Textbox(
+                    label="Her message",
+                    placeholder="Don't just tell me what she said -- show me exactly what she texted...",
+                    lines=4, max_lines=8)
+                submit_btn = gr.Button("Submit", variant="primary", elem_classes=["primary-btn"])
 
-        analysis_output = gr.Markdown(value="", visible=False)
+                analysis_output = gr.Markdown(value="", visible=False)
 
-        # Step 2
-        with gr.Column(visible=False) as step2:
-            gr.Markdown("### Step 2: What do you want to respond?")
-            draft_text = gr.Textbox(
-                label="Your draft response",
-                placeholder="Type what you're thinking of sending her...",
-                lines=3, max_lines=6)
-            with gr.Row():
-                critique_btn = gr.Button("Get Critique", variant="primary", elem_classes=["primary-btn"])
-                suggest_btn = gr.Button("Suggest For Me", variant="secondary")
+                # Step 2
+                with gr.Column(visible=False) as step2:
+                    gr.Markdown("### Step 2: What do you want to respond?")
+                    draft_text = gr.Textbox(
+                        label="Your draft response",
+                        placeholder="Type what you're thinking of sending her...",
+                        lines=3, max_lines=6)
+                    with gr.Row():
+                        critique_btn = gr.Button("Get Critique", variant="primary", elem_classes=["primary-btn"])
+                        suggest_btn = gr.Button("Suggest For Me", variant="secondary")
 
-        coaching_output = gr.Markdown(value="", visible=False)
-        reset_btn = gr.Button("Start Over", variant="secondary", size="sm")
+                coaching_output = gr.Markdown(value="", visible=False)
+                reset_btn = gr.Button("Start Over", variant="secondary", size="sm")
 
-        gr.Markdown(f"---\n*Model: {_active_provider_label()}*")
+                gr.Markdown(f"---\n*Model: {_active_provider_label()}*")
 
-        # Wire events
-        submit_btn.click(handle_step1, [wife_text],
-                         [analysis_output, wife_state, step2, analysis_output, crisis_box])
-        critique_btn.click(handle_critique, [draft_text, wife_state],
-                           [coaching_output, coaching_output])
-        suggest_btn.click(handle_suggest, [wife_state],
-                          [coaching_output, coaching_output])
-        reset_btn.click(handle_reset, [],
-                        [wife_text, analysis_output, wife_state, step2, crisis_box, draft_text, coaching_output])
+                # Wire coaching events
+                submit_btn.click(handle_step1, [wife_text, session_state],
+                                 [analysis_output, wife_state, step2, analysis_output, crisis_box, session_state])
+                critique_btn.click(handle_critique, [draft_text, wife_state, session_state],
+                                   [coaching_output, coaching_output])
+                suggest_btn.click(handle_suggest, [wife_state, session_state],
+                                  [coaching_output, coaching_output])
+                reset_btn.click(handle_reset, [],
+                                [wife_text, analysis_output, wife_state, step2, crisis_box, draft_text, coaching_output, session_state])
+
+            # ---- Admin chat log tab ----
+            with gr.TabItem("Admin: Chat Logs"):
+                gr.Markdown("### Chat Log Viewer")
+                gr.Markdown("Enter the admin PIN to view coaching session logs.")
+                admin_pin_input = gr.Textbox(
+                    label="PIN",
+                    placeholder="Enter admin PIN...",
+                    type="password",
+                    max_lines=1)
+                with gr.Row():
+                    view_logs_btn = gr.Button("View Logs", variant="primary")
+                    clear_logs_btn = gr.Button("Clear Logs", variant="stop")
+                admin_log_output = gr.Markdown(value="")
+
+                # Wire admin events
+                view_logs_btn.click(handle_view_logs, [admin_pin_input], [admin_log_output])
+                clear_logs_btn.click(handle_clear_logs, [admin_pin_input], [admin_log_output])
 
     return app
 
